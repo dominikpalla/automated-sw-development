@@ -1,4 +1,3 @@
-# manager.py
 """
 Manager (Flask app)
 -------------------
@@ -9,12 +8,15 @@ Also serves:
 - Chat UI: /
 - Generated modules overview: /generated
 - API endpoints: /interpreter/*, /uml/translate, /codegen/run
+- Dynamic dispatcher for generated entity routes
 """
 
 from flask import Flask, request, jsonify, render_template
 from pathlib import Path
 from dotenv import load_dotenv
-import os, json, importlib.util
+import os, json, importlib
+
+from jinja2 import ChoiceLoader, FileSystemLoader
 
 from interpreter import Interpreter
 from uml_translator import UMLTranslator
@@ -36,26 +38,66 @@ interpreter = Interpreter(METADATA_PATH)
 uml_translator = UMLTranslator()
 codegen = CodeGen(METADATA_PATH, MODULES_DIR)
 
+# -------------------------
+# Jinja loader refresh
+# -------------------------
+def refresh_template_loader():
+    """
+    Reload Jinja template search paths so new entity templates are picked up
+    without restarting the server.
+    """
+    extra_template_paths = []
+    for entity_dir in MODULES_DIR.glob("*"):
+        tdir = entity_dir / "templates"
+        if tdir.exists():
+            extra_template_paths.append(str(tdir))
+
+    if extra_template_paths:
+        app.jinja_loader = ChoiceLoader(
+            [app.jinja_loader] + [FileSystemLoader(p) for p in extra_template_paths]
+        )
+        print(f"🔄 Refreshed template loader with: {extra_template_paths}")
+
+# initial refresh at startup
+refresh_template_loader()
 
 # -------------------------
-# Helpers
+# Dynamic Dispatcher
 # -------------------------
-def register_generated_modules(app, modules_dir: Path):
-    """
-    Dynamically load *_routes.py from each entity folder in modules/
-    and register their Blueprint.
-    Each *_routes.py must define: bp = Blueprint("<entity>", __name__)
-    """
-    for file in modules_dir.glob("*/*_routes.py"):
-        module_name = file.stem
-        spec = importlib.util.spec_from_file_location(module_name, file)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        if hasattr(mod, "bp"):
-            entity = module_name.replace("_routes", "")
-            # url prefix = /<entity>
-            app.register_blueprint(mod.bp, url_prefix=f"/{entity}")
+dynamic_registry = {}
 
+def load_entity(entity: str):
+    """
+    Dynamically import <entity>_routes.py and store its routes dict.
+    """
+    try:
+        module_path = f"modules.{entity}.{entity}_routes"
+        mod = importlib.import_module(module_path)
+        if hasattr(mod, "routes"):
+            dynamic_registry[entity] = mod.routes
+            print(f"✅ Loaded entity '{entity}' with routes: {list(mod.routes.keys())}")
+        else:
+            print(f"⚠️ Module {module_path} has no 'routes' dict.")
+    except Exception as e:
+        print(f"❌ Failed to load {entity}: {e}")
+
+@app.route("/<entity>/<action>", methods=["GET", "POST"])
+@app.route("/<entity>/<action>/<int:item_id>", methods=["GET", "POST"])
+def dynamic_dispatch(entity, action, item_id=None):
+    """
+    Catch-all dispatcher for /<entity>/<action> URLs.
+    Looks up the handler function in dynamic_registry.
+    """
+    if entity not in dynamic_registry:
+        load_entity(entity)
+
+    routes = dynamic_registry.get(entity, {})
+    handler = routes.get(action)
+
+    if not handler:
+        return f"No route '{action}' for entity '{entity}'", 404
+
+    return handler(item_id) if item_id is not None else handler()
 
 def list_generated_entities(modules_dir: Path):
     """
@@ -63,10 +105,8 @@ def list_generated_entities(modules_dir: Path):
     """
     entities = []
     for file in modules_dir.glob("*/*_routes.py"):
-        entity = file.stem.replace("_routes", "")
-        entities.append(entity)
+        entities.append(file.parent.name)
     return entities
-
 
 # -------------------------
 # Views
@@ -75,13 +115,11 @@ def list_generated_entities(modules_dir: Path):
 def index_view():
     return render_template("index.html")
 
-
 @app.get("/generated")
 def generated_index():
     """Show list of generated entities with CRUD links"""
     entities = list_generated_entities(MODULES_DIR)
     return render_template("generated_index.html", entities=entities)
-
 
 # -------------------------
 # Interpreter / UML
@@ -93,12 +131,10 @@ def interpreter_process():
     out = interpreter.process(msg)
     return jsonify(out)
 
-
 @app.post("/interpreter/confirm")
 def interpreter_confirm():
     out = interpreter.confirm()
     return jsonify(out)
-
 
 @app.post("/uml/translate")
 def uml_translate():
@@ -106,7 +142,6 @@ def uml_translate():
     summary = payload.get("summary", "")
     out = uml_translator.translate(summary)
     return jsonify(out)
-
 
 # -------------------------
 # CodeGen
@@ -122,6 +157,9 @@ def codegen_run():
     cg_in = {"mode": mode, "text": spec} if mode == "nl" else {"mode": "uml", "json": spec}
     out = codegen.generate_crud_app(cg_in)
 
+    # refresh template loader so new entity templates are available immediately
+    refresh_template_loader()
+
     # Return filenames + contents for preview
     files = {}
     for fname in out.get("artefacts", []):
@@ -131,12 +169,9 @@ def codegen_run():
 
     return jsonify({"status": out.get("status"), "files": files})
 
-
 # -------------------------
 # Start
 # -------------------------
 if __name__ == "__main__":
-    # Register any already generated modules
-    register_generated_modules(app, MODULES_DIR)
-
+    print(f"📦 Available entities: {list_generated_entities(MODULES_DIR)}")
     app.run(host="0.0.0.0", port=8000, debug=True)
