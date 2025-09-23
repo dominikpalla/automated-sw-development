@@ -1,90 +1,116 @@
 # uml_translator.py
-import re
+"""
+UML Translator
+--------------
+Takes a clarified NL requirement (from Interpreter) and produces a UML-enriched JSON specification.
+
+Schema includes:
+- entities (with attributes, datatypes, requiredness, visibility, default)
+- relations (association, aggregation, composition + multiplicity)
+- views (simple forms)
+- optional UML sequence diagrams (messages)
+"""
+
+import os
+import json
+from openai import OpenAI
 
 
 class UMLTranslator:
-    """
-    UMLTranslator converts clarified natural language requirements
-    into a UML-enriched JSON specification.
-    - Adds ui_hints for form generation (e.g., <select> for foreign keys).
-    - No diagrams rendered; JSON only.
-    """
+    def __init__(self):
+        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.model = os.getenv("OPENAI_MODEL", "gpt-4.1")
 
-    def translate(self, clarified_text: str):
-        text = clarified_text.lower()
-        entities, relations, views, clarifications = [], [], [], []
+    def translate(self, nl_summary: str) -> dict:
+        """
+        Convert clarified NL summary into UML-enriched JSON.
+        Returns:
+          {
+            "status": "ok"|"error",
+            "json": {... UML spec ...},
+            "clarifications": [...],
+            "usage": {prompt_tokens, completion_tokens}
+          }
+        """
+        prompt = f"""
+You are a UML specification generator.
 
-        # --- Example heuristics (extendable with AI if needed) ---
-        if "customer" in text:
-            entities.append({
-                "name": "Customer",
-                "attributes": [
-                    {"name": "id", "type": "int", "required": True},
-                    {"name": "name", "type": "string", "required": True}
-                ],
-                "operations": [],
-                "ui_hints": {}
-            })
+Input requirement (clarified summary):
+{nl_summary}
 
-        if "car" in text:
-            ent = {
-                "name": "Car",
-                "attributes": [
-                    {"name": "id", "type": "int", "required": True},
-                    {"name": "make", "type": "string", "required": True},
-                    {"name": "model", "type": "string", "required": True},
-                ],
-                "operations": [],
-                "ui_hints": {}
-            }
-            entities.append(ent)
+TASK:
+Produce a JSON specification describing entities, attributes, relations, and UI hints.
 
-        # --- Relation detection ---
-        if "customer" in text and "car" in text:
-            relations.append({
-                "from": "Customer",
-                "to": "Car",
-                "relation_type": "association",
-                "multiplicity_from": "1",
-                "multiplicity_to": "N",
-                "role_from": None,
-                "role_to": None
-            })
+Rules:
+- Use this schema:
+{{
+  "entities": [
+    {{
+      "name": "EntityName",
+      "attributes": [
+        {{
+          "name": "attr",
+          "type": "string|int|float|bool|date",
+          "required": true|false,
+          "visibility": "public|private|protected",
+          "default": null|<literal>
+        }}
+      ],
+      "operations": []  // optional
+    }}
+  ],
+  "relations": [
+    {{
+      "from": "EntityA",
+      "to": "EntityB",
+      "relation_type": "association|aggregation|composition",
+      "multiplicity_from": "1|N|0..1|0..N",
+      "multiplicity_to": "1|N|0..1|0..N",
+      "role_from": null,
+      "role_to": null
+    }}
+  ],
+  "views": [
+    {{
+      "name": "EntityDetail",
+      "entity": "EntityName",
+      "elements": ["attr1","attr2"]
+    }}
+  ],
+  "uml": {{
+    "sequence": [ {{ "from":"User", "to":"System", "message":"..." }} ]
+  }}
+}}
 
-            # Add foreign key to Car
-            for e in entities:
-                if e["name"] == "Car":
-                    e["attributes"].append(
-                        {"name": "customer_id", "type": "int", "required": True}
-                    )
-                    e["ui_hints"] = {
-                        "select_fields": [
-                            {
-                                "attribute": "customer_id",
-                                "target_entity": "Customer",
-                                "label_attr": "name"
-                            }
-                        ]
-                    }
+- Always include "entities" and "relations" arrays (can be empty if not needed).
+- Include data types for all attributes.
+- Include required flags and defaults if obvious.
+- Ensure multiplicities are explicitly set for all relations.
+- Keep it valid JSON, no comments, no code fences.
+"""
 
-        if not entities:
-            clarifications.append("No entities were detected. Please specify entities, attributes, and relations.")
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
 
-        uml_json = {
-            "entities": entities,
-            "relations": relations,
-            "views": views,
-            "uml": {"sequence": []}
-        }
-
+        content = (resp.choices[0].message.content or "").strip()
         usage = {
-            "prompt_tokens": len(clarified_text.split()),
-            "completion_tokens": len(str(uml_json).split())
+            "prompt_tokens": getattr(resp.usage, "prompt_tokens", 0),
+            "completion_tokens": getattr(resp.usage, "completion_tokens", 0),
         }
+
+        try:
+            spec = json.loads(content)
+            status = "ok"
+        except Exception as e:
+            spec = {}
+            status = "error"
 
         return {
-            "status": "ok" if entities else "incomplete",
-            "json": uml_json,
-            "clarifications": clarifications,
+            "status": status,
+            "json": spec,
+            "clarifications": [],
             "usage": usage
         }

@@ -1,225 +1,137 @@
-# cogen.py
-import os
-import json
+"""
+CodeGen module
+--------------
+Generates CRUD artefacts for Mini GAI CRM.
+
+Behaviour:
+- NL mode: AI model generates artefacts based on free-form requirement text.
+- UML mode: AI model generates artefacts based on UML JSON specification.
+- Repair mode: (future) AI minimally fixes artefacts.
+
+Output structure (per entity):
+modules/
+  <entity>/
+    app.py
+    <entity>.py
+    <entity>_storage.py
+    <entity>_routes.py
+    templates/
+      list.html
+      form.html
+"""
+
+import os, json
 from pathlib import Path
 from openai import OpenAI
 
 
 class CodeGen:
-    """
-    CodeGen generates or repairs artefacts:
-    - NL mode: pass the requirement directly to the AI model with strict instructions.
-    - UML mode: deterministic generation from UML JSON (with ui_hints).
-    - Repair mode: artefacts + repair_prompt (from Feedback).
-    """
-
     def __init__(self, metadata_path: Path, modules_dir: Path):
-        self.metadata_path = Path(metadata_path)
-        self.modules_dir = Path(modules_dir)
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.model = os.getenv("OPENAI_MODEL", "gpt-4.1")
+        self.modules_dir = Path(modules_dir)
+        self.modules_dir.mkdir(exist_ok=True)
+        # zajistí __init__.py v root modules/
+        self.ensure_init_py(self.modules_dir)
 
-    # -------------------------
-    # Main entry
-    # -------------------------
-    def generate(self, payload: dict):
-        if "repair_prompt" in payload:
-            return self._repair(payload)
+    @staticmethod
+    def ensure_init_py(path: Path):
+        """Ensure __init__.py exists in given folder."""
+        path = Path(path)
+        init_path = path / "__init__.py"
+        if not init_path.exists():
+            init_path.write_text("# auto-generated init\n", encoding="utf-8")
 
-        mode = payload.get("mode", "nl")
-        if mode == "uml":
-            return self._generate_from_uml(payload.get("json", {}))
+    def generate_crud_app(self, payload: dict) -> dict:
+        """
+        Generate CRUD artefacts from either NL summary or UML JSON spec.
+        Saves artefacts into modules/<entity>/ directories.
+        NOTE: Uses in-memory storage (lists/dicts).
+              Structure can be extended to use a real DB later.
+        """
+        if payload.get("mode") == "nl":
+            spec = payload.get("text", "")
+            mode_str = f"Natural language requirement:\n{spec}"
+        elif payload.get("mode") == "uml":
+            spec = json.dumps(payload.get("json", {}), indent=2)
+            mode_str = f"UML JSON specification:\n{spec}"
         else:
-            return self._generate_from_nl(payload.get("text", ""))
-
-    # -------------------------
-    # NL mode
-    # -------------------------
-    def _generate_from_nl(self, text: str):
-        if not text:
-            return {
-                "status": "needs_clarification",
-                "questions": ["Requirement text is empty. Please provide details."]
-            }
+            return {"status": "error", "message": "Unsupported mode"}
 
         prompt = f"""
-        You are an assistant that generates Python + HTML code artefacts.
+You are a software generator. Based on the following requirement/specification,
+generate a minimal CRUD web app in Python Flask with in-memory storage.
 
-        Requirement:
-        {text}
+{mode_str}
 
-        Instructions:
-        - Generate Python classes (models) with attributes.
-        - Generate CRUD operations (create, read, update, delete).
-        - Generate simple HTML templates (forms, tables, lists).
-        - If entities are related (e.g., Car belongs to Customer):
-          - Add foreign key attributes in Python models.
-          - In child entity forms, generate an HTML <select> dropdown
-            to choose the related parent entity.
-        - Do NOT use JavaScript or advanced frameworks.
-        - Output must be a JSON object mapping filenames to code strings.
-        """
+REQUIREMENTS:
+- For each entity, create a dedicated folder inside modules/, named after the entity (lowercase).
+  Example: modules/customer/
+- Inside that folder include:
+  * app.py – minimal Flask app that imports and registers the Blueprint, runs on port 8000
+  * <entity>.py – Python class with attributes
+  * <entity>_storage.py – in-memory list/dict with auto-incrementing ID
+  * <entity>_routes.py – Flask Blueprint exposing CRUD routes:
+    - /list
+    - /add
+    - /edit/<id>
+    - /delete/<id>
+    Must define and export:
+      bp = Blueprint("<entity>", __name__, 
+                     template_folder=os.path.join(os.path.dirname(__file__), "templates"))
+    IMPORTANT: Do NOT include the entity name in the route paths. 
+    The manager will handle prefixing the routes with /<entity>.
+  * templates/ folder containing:
+      - list.html (Bootstrap table of records)
+      - form.html (Bootstrap form for add/edit)
+- Use only in-memory storage. But structure code so DB layer could replace it later.
+- Relationships (if given) must be reflected with foreign keys (e.g., Car has customer_id).
+- Use Bootstrap for HTML styling.
+- Output MUST be a valid JSON object mapping relative filenames (with subfolders) to file contents.
+  Example:
+  {{
+    "customer/app.py": "...",
+    "customer/customer.py": "...",
+    "customer/customer_storage.py": "...",
+    "customer/customer_routes.py": "...",
+    "customer/templates/list.html": "...",
+    "customer/templates/form.html": "..."
+  }}
+- Do NOT include explanations, code fences, or text outside JSON.
+"""
 
         resp = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
-
-        content = resp.choices[0].message.content.strip()
-        usage = {
-            "prompt_tokens": resp.usage.prompt_tokens,
-            "completion_tokens": resp.usage.completion_tokens
-        }
+        content = (resp.choices[0].message.content or "").strip()
+        # strip possible code fences
+        if content.startswith("```"):
+            content = content.split("```", 1)[-1]
+            if content.startswith("json"):
+                content = content[4:]
+        content = content.strip()
 
         try:
             artefacts = json.loads(content)
-        except Exception:
-            return {
-                "status": "error",
-                "message": "Could not parse AI output into JSON.",
-                "usage": usage
-            }
+        except Exception as e:
+            return {"status": "error", "message": f"Invalid JSON from AI: {e}", "raw": content}
 
-        report = {
-            "entities": [f.split(".")[0] for f in artefacts.keys() if f.endswith(".model.py")],
-            "relations": [],  # handled heuristically by LLM in NL mode
-            "files": list(artefacts.keys())
-        }
-
-        return {
-            "status": "ok",
-            "metadata_delta": {"entities": report["entities"], "relations": []},
-            "artefacts": artefacts,
-            "report": report,
-            "usage": usage
-        }
-
-    # -------------------------
-    # UML mode
-    # -------------------------
-    def _generate_from_uml(self, spec: dict):
-        entities = [e["name"] for e in spec.get("entities", [])]
-        relations = spec.get("relations", [])
-        views = spec.get("views", [])
-
-        artefacts = {}
-        for ent in entities:
-            artefacts[f"{ent}.model.py"] = self._template_model(ent, spec)
-            artefacts[f"{ent}.form.html"] = self._template_form(ent, spec)
-
-        metadata_delta = {"entities": entities, "relations": relations, "views": views}
-        report = {"entities": entities, "relations": relations, "files": list(artefacts.keys())}
-
-        usage = {
-            "prompt_tokens": len(json.dumps(spec).split()),
-            "completion_tokens": sum(len(c.split()) for c in artefacts.values())
-        }
+        # Save artefacts into entity-specific folders under modules/
+        saved_files = []
+        for fname, code in artefacts.items():
+            clean_fname = fname
+            if clean_fname.startswith("modules/"):
+                clean_fname = clean_fname[len("modules/"):]  # odřízne první "modules/"
+            path = self.modules_dir / clean_fname
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(code, encoding="utf-8")
+            saved_files.append(str(path.relative_to(self.modules_dir)))
+            # zajistí __init__.py v každém adresáři
+            self.ensure_init_py(path.parent)
 
         return {
             "status": "ok",
-            "metadata_delta": metadata_delta,
-            "artefacts": artefacts,
-            "report": report,
-            "usage": usage
+            "artefacts": saved_files
         }
-
-    # -------------------------
-    # Repair mode
-    # -------------------------
-    def _repair(self, payload: dict):
-        artefacts = payload.get("artefacts", {})
-        repair_prompt = payload.get("repair_prompt", "")
-
-        if not artefacts or not repair_prompt:
-            return {
-                "status": "error",
-                "message": "Repair requested but artefacts or prompt are missing."
-            }
-
-        prompt = f"""
-        You are an assistant that repairs generated Python + HTML code artefacts.
-
-        Repair instruction:
-        {repair_prompt}
-
-        Current artefacts:
-        {json.dumps(artefacts, indent=2)}
-
-        Task:
-        - Modify only what is necessary to resolve the issue.
-        - Keep CRUD logic and simple HTML forms intact.
-        - Do not introduce JavaScript.
-        - Return JSON mapping filenames to corrected code.
-        """
-
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-
-        content = resp.choices[0].message.content.strip()
-        usage = {
-            "prompt_tokens": resp.usage.prompt_tokens,
-            "completion_tokens": resp.usage.completion_tokens
-        }
-
-        try:
-            fixed = json.loads(content)
-        except Exception:
-            fixed = artefacts  # fallback if parsing fails
-
-        report = {"entities": [], "relations": [], "files": list(fixed.keys())}
-
-        return {
-            "status": "ok",
-            "metadata_delta": {},
-            "artefacts": fixed,
-            "report": report,
-            "usage": usage
-        }
-
-    # -------------------------
-    # Templates for UML mode
-    # -------------------------
-    def _template_model(self, entity: str, spec: dict):
-        return f"""class {entity}:
-    def __init__(self, id: int = None):
-        self.id = id
-"""
-
-    def _template_form(self, entity: str, spec: dict):
-        ent_spec = next((e for e in spec.get("entities", []) if e["name"] == entity), {})
-        form_fields = ""
-
-        # Default fields
-        for attr in ent_spec.get("attributes", []):
-            select_hint = None
-            for sel in ent_spec.get("ui_hints", {}).get("select_fields", []):
-                if sel["attribute"] == attr["name"]:
-                    select_hint = sel
-                    break
-
-            if select_hint:
-                target = select_hint["target_entity"]
-                label = select_hint.get("label_attr", "id")
-                form_fields += f"""
-    <label for="{attr['name']}">{target}:</label>
-    <select id="{attr['name']}" name="{attr['name']}" required>
-        {{% for item in {target.lower()}s %}}
-            <option value="{{{{ item.id }}}}">{{{{ item.{label} }}}}</option>
-        {{% endfor %}}
-    </select>
-"""
-            else:
-                form_fields += f"""
-    <label for="{attr['name']}">{attr['name'].capitalize()}:</label>
-    <input type="text" id="{attr['name']}" name="{attr['name']}" required>
-"""
-
-        return f"""<form method="post" action="/{entity.lower()}/create">
-    {form_fields}
-    <button type="submit">Create {entity}</button>
-</form>
-"""
