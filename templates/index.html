@@ -60,9 +60,12 @@
 
   <div class="d-flex justify-content-between align-items-center mb-3">
     <h1 class="h4 mb-0">💬 Mini GAI CRM Chat</h1>
-    <div class="form-check form-switch">
-      <input class="form-check-input" type="checkbox" id="umlMode">
-      <label class="form-check-label" for="umlMode">UML Mode</label>
+    <div class="d-flex gap-3 align-items-center">
+      <a href="/generated" class="btn btn-outline-primary btn-sm">📂 Generated Modules</a>
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="umlMode">
+        <label class="form-check-label" for="umlMode">UML Mode</label>
+      </div>
     </div>
   </div>
 
@@ -74,6 +77,10 @@
   </div>
 
   <script>
+    let lastSpec = null;
+    let lastFiles = null;
+    let lastFeedback = null;
+
     function addMessage(text, sender="ai") {
       $("#chatBox").append(`<div class="msg ${sender}">${text}</div>`);
       $("#chatBox").scrollTop($("#chatBox")[0].scrollHeight);
@@ -94,6 +101,33 @@
       $("#chatBox").scrollTop($("#chatBox")[0].scrollHeight);
     }
 
+    function addFilesBlock(files) {
+      let idBase = "file_" + Date.now();
+      Object.keys(files).forEach((fname, idx) => {
+        let id = idBase + "_" + idx;
+        $("#chatBox").append(`
+          <div class="msg ai">
+            <span class="toggle-json" data-target="${id}">📄 ${fname} (click to expand)</span>
+            <div id="${id}" class="hidden-json">${escapeHtml(files[fname])}</div>
+          </div>
+        `);
+      });
+      $(".toggle-json").off("click").on("click", function() {
+        let target = $(this).data("target");
+        $("#" + target).toggle();
+      });
+      $("#chatBox").scrollTop($("#chatBox")[0].scrollHeight);
+    }
+
+    function escapeHtml(text) {
+      return text.replace(/[&<>'"]/g, function (c) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+      });
+    }
+
+    // ---------------------------
+    // Chat flow
+    // ---------------------------
     $("#sendChat").on("click", function() {
       const msg = $("#chatInput").val();
       if (!msg) return;
@@ -118,88 +152,112 @@
       });
     });
 
-    function addFilesBlock(files) {
-    let idBase = "file_" + Date.now();
-    Object.keys(files).forEach((fname, idx) => {
-      let id = idBase + "_" + idx;
-      $("#chatBox").append(`
-        <div class="msg ai">
-          <span class="toggle-json" data-target="${id}">📄 ${fname} (click to expand)</span>
-          <div id="${id}" class="hidden-json">${escapeHtml(files[fname])}</div>
-        </div>
-      `);
-    });
-    $(".toggle-json").off("click").on("click", function() {
-      let target = $(this).data("target");
-      $("#" + target).toggle();
-    });
-    $("#chatBox").scrollTop($("#chatBox")[0].scrollHeight);
-  }
+    function confirmSpec() {
+      $.post("/interpreter/confirm", {}, function(res) {
+        addMessage("✅ Approved summary: " + res.text, "ai");
 
-  function escapeHtml(text) {
-    return text.replace(/[&<>'"]/g, function (c) {
-      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
-    });
-  }
+        let mode = $("#umlMode").is(":checked") ? "uml" : "nl";
+        lastSpec = res.text;
 
-  function confirmSpec() {
-    $.post("/interpreter/confirm", {}, function(res) {
-      addMessage("✅ Approved summary: " + res.text, "ai");
+        if (mode === "uml") {
+          $.ajax({
+            url: "/uml/translate",
+            method: "POST",
+            contentType: "application/json",
+            data: JSON.stringify({ summary: res.text }),
+            success: function(umlRes) {
+              if (umlRes.status === "ok") {
+                addJsonBlock("📐 UML JSON Spec", umlRes.json);
+                lastSpec = umlRes.json;
+                runCodegen("uml", umlRes.json);
+              } else {
+                addMessage("⚠️ UML translation failed.", "ai");
+              }
+            }
+          });
+        } else {
+          runCodegen("nl", res.text);
+        }
+      });
+      $("#approveBtn").remove();
+    }
 
-      let mode = $("#umlMode").is(":checked") ? "uml" : "nl";
+    function runCodegen(mode, spec) {
+      addMessage("⚙️ Generating code...", "ai");
 
-      if (mode === "uml") {
-        $.ajax({
-          url: "/uml/translate",
-          method: "POST",
-          contentType: "application/json",
-          data: JSON.stringify({ summary: res.text }),
-          success: function(umlRes) {
-            if (umlRes.status === "ok") {
-              addJsonBlock("📐 UML JSON Spec", umlRes.json);
-              // send spec_json to codegen
-              $.ajax({
-                url: "/codegen/run",
-                method: "POST",
-                contentType: "application/json",
-                data: JSON.stringify({ mode: "uml", spec_json: umlRes.json }),
-                success: function(cgRes) {
-                  if (cgRes.status === "ok") {
-                    addFilesBlock(cgRes.files);
-                  }
-                }
-              });
-            } else {
-              addMessage("⚠️ UML translation failed.", "ai");
+      let payload = mode === "uml" ? { mode: "uml", spec_json: spec } : { mode: "nl", spec: spec };
+
+      $.ajax({
+        url: "/codegen/run",
+        method: "POST",
+        contentType: "application/json",
+        data: JSON.stringify(payload),
+        success: function(cgRes) {
+          if (cgRes.files) {
+            lastFiles = cgRes.files;
+            addFilesBlock(cgRes.files);
+          }
+          addMessage("🔍 Running validation...", "ai");
+
+          runValidation(lastSpec, lastFiles);
+        }
+      });
+    }
+
+    function runValidation(spec, files) {
+      $.ajax({
+        url: "/validate/run",
+        method: "POST",
+        contentType: "application/json",
+        data: JSON.stringify({ spec: spec, files: files }),
+        success: function(valRes) {
+          if (valRes.validation.status === "ok") {
+            addMessage(`✅ Validation passed: All tests succeeded.<br><a href="/generated" class="btn btn-success btn-sm mt-2">📂 View Generated Modules</a>`, "ai");
+          } else {
+            addMessage("⚠️ Validation failed at stage: " + valRes.validation.stage, "ai");
+            addMessage("👉 " + valRes.validation.message, "ai");
+            if (valRes.feedback) {
+              lastFeedback = valRes.feedback;
+              addJsonBlock("🛠 Feedback instructions", valRes.feedback);
+              $("#autoFixBtn").remove();
+              $("#chatBox").append(`<button id="autoFixBtn" class="btn btn-warning btn-sm">🔧 Auto Repair</button>`);
+              $("#autoFixBtn").on("click", autoRepair);
             }
           }
-        });
-      } else {
-        // send plain NL summary to codegen
-        $.ajax({
-          url: "/codegen/run",
-          method: "POST",
-          contentType: "application/json",
-          data: JSON.stringify({ mode: "nl", spec: res.text }),
-          success: function(cgRes) {
-            if (cgRes.status === "ok") {
-              addFilesBlock(cgRes.files);
-            }
+        }
+      });
+    }
+
+    function autoRepair() {
+      addMessage("🔧 Applying auto-repair based on feedback...", "ai");
+
+      $.ajax({
+        url: "/codegen/fix",
+        method: "POST",
+        contentType: "application/json",
+        data: JSON.stringify({
+          spec: lastSpec,
+          artefacts: lastFiles,
+          feedback: lastFeedback
+        }),
+        success: function(fixRes) {
+          if (fixRes.files) {
+            lastFiles = fixRes.files;
+            addFilesBlock(fixRes.files);
           }
-        });
+          addMessage("🔍 Re-running validation after fix...", "ai");
+          runValidation(lastSpec, lastFiles);
+        }
+      });
+    }
+
+    // Odesílání zprávy klávesou Enter
+    $("#chatInput").on("keypress", function(e) {
+      if (e.which === 13 && !e.shiftKey) {
+        e.preventDefault();
+        $("#sendChat").click();
       }
     });
-    $("#approveBtn").remove();
-  }
-
-// Odesílání zprávy klávesou Enter
-$("#chatInput").on("keypress", function(e) {
-  if (e.which === 13 && !e.shiftKey) { // Enter bez Shift
-    e.preventDefault();
-    $("#sendChat").click();
-  }
-});
-
   </script>
 </body>
 </html>
